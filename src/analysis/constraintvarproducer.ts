@@ -64,6 +64,8 @@ export class ConstraintVarProducer<RVT extends RepresentativeVar | MergeRepresen
     expVar(exp: Expression | JSXIdentifier | JSXMemberExpression | JSXNamespacedName, path: NodePath): ConstraintVar | undefined {
         while (isParenthesizedExpression(exp))
             exp = exp.expression; // for parenthesized expressions, use the inner expression
+        if (isJSXIdentifier(exp) && exp.name[0] !== exp.name[0].toUpperCase()) // component names always start with capital letter
+            return undefined;
         if (isIdentifier(exp) || isJSXIdentifier(exp)) {
             const id = this.identVar(exp, path);
             if (id instanceof NodeVar && exp.name === "undefined" && (id.node?.loc as Location)?.native === "%ecmascript")
@@ -83,9 +85,9 @@ export class ConstraintVarProducer<RVT extends RepresentativeVar | MergeRepresen
     identVar(id: Identifier | JSXIdentifier, path: NodePath): ConstraintVar {
         const binding = path.scope.getBinding(id.name);
         let d;
-        if (binding) {
+        if (binding)
             d = binding.identifier;
-        } else {
+        else {
             if (id.name === "arguments") {
                 const fun = this.f.registerArguments(path);
                 return fun ? this.argumentsVar(fun) : this.nodeVar(id); // using the identifier itself as fallback if no enclosing function

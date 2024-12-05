@@ -61,6 +61,8 @@ export const options: {
     callgraphExternal: boolean,
     diagnosticsJson: string | undefined,
     maxWaves: number | undefined,
+    maxIndirections: number | undefined,
+    fullIndirectionBounding: boolean,
     diagnostics: boolean,
     patchEscaping: boolean,
     patchDynamics: boolean,
@@ -79,6 +81,7 @@ export const options: {
     proto: boolean,
     objSpread: boolean,
     nativeOverwrites: boolean,
+    ignoreImpreciseNativeCalls: boolean,
 } = {
     callgraphHtml: undefined,
     dataflowHtml: undefined,
@@ -131,6 +134,8 @@ export const options: {
     callgraphExternal: true,
     diagnosticsJson: undefined,
     maxWaves: undefined,
+    maxIndirections: undefined,
+    fullIndirectionBounding: false,
     diagnostics: false,
     patchEscaping: true,
     patchDynamics: false,
@@ -148,7 +153,8 @@ export const options: {
     oldobj: false,
     proto: false,
     objSpread: false,
-    nativeOverwrites: false
+    nativeOverwrites: false,
+    ignoreImpreciseNativeCalls: false
 };
 
 export function setOptions(opts: OptionValues & Partial<typeof options>) {
@@ -159,6 +165,10 @@ export function setOptions(opts: OptionValues & Partial<typeof options>) {
     }
     if (options.apiUsage)
         options.ignoreDependencies = true;
+    if (options.excludeEntries)
+        options.excludeEntries =
+            options.excludeEntries.length === 0 ? undefined : // micromatch bug workaround
+                options.excludeEntries.map(p => `**/${p}`);
 }
 
 /**

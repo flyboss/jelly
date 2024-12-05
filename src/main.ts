@@ -24,7 +24,7 @@ import {compareCallGraphs} from "./output/compare";
 import {getMemoryLimit} from "./misc/memory";
 import Solver from "./analysis/solver";
 import {exportCallGraphHtml, exportDataFlowGraphHtml} from "./output/visualizer";
-import {VulnerabilityDetector, VulnerabilityResults} from "./patternmatching/vulnerabilitydetector";
+import {VulnerabilityDetector} from "./patternmatching/vulnerabilitydetector";
 import {Vulnerability} from "./typings/vulnerabilities";
 import {addAll} from "./misc/util";
 import {getAPIExported, reportAccessPaths, reportAPIExportedFunctions} from "./patternmatching/apiexported";
@@ -89,6 +89,8 @@ program
     .option("--diagnostics-json <file>", "save analysis diagnostics in JSON file")
     .option("--variable-kinds", "report constraint variable kinds")
     .option("--max-waves <number>", "limit number of fixpoint waves")
+    .option("--max-indirections <number>", "limit number of function call and property write indirections")
+    .option("--full-indirection-bounding", "enable indirection bounding for method calls and property reads (use with --max-indirections)")
     .option("--typescript-library-usage <file>", "save TypeScript library usage in JSON file, no analysis")
     .option("--modules-only", "report reachable packages and modules only, no analysis")
     .option("--compare-callgraphs", "compare two call graphs given as JSON files, no analysis")
@@ -104,6 +106,7 @@ program
     .option("--proto", "enable model of assignments to the __proto__ property")
     .option("--obj-spread", "enable model of spread syntax for object literals ({...obj})")
     .option("--native-overwrites", "allow overwriting of native object properties")
+    .option("--ignore-imprecise-native-calls", "ignore imprecise native calls")
     .usage("[options] [files]")
     .addHelpText("after",
         "\nAll modules reachable by require/import from the given files are included in the analysis\n" +
@@ -306,16 +309,7 @@ async function main() {
             if (options.typescript)
                 typer = new TypeScriptTypeInferrer(files);
 
-            const vr: VulnerabilityResults = {};
-            if (vulnerabilityDetector) {
-                vr.package = vulnerabilityDetector.findPackagesThatMayDependOnVulnerablePackages(f);
-                vr.module = vulnerabilityDetector.findModulesThatMayDependOnVulnerableModules(f);
-                vr.function = vulnerabilityDetector.findFunctionsThatMayReachVulnerableFunctions(f);
-                vr.call = vulnerabilityDetector.findCallsThatMayReachVulnerableFunctions(f, vr.function);
-                vulnerabilityDetector.reportResults(f, vr);
-                vr.matches = vulnerabilityDetector.patternMatch(f, typer, solver.diagnostics);
-                // TODO: find functions that may reach functions in vulnerabilities.matches
-            }
+            const vr = vulnerabilityDetector?.collectAllVulnerabilityResults(solver, typer) ?? {};
 
             if (options.callgraphHtml) {
                 const file = options.callgraphHtml;

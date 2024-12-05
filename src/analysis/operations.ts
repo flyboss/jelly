@@ -15,20 +15,39 @@ import {
     isRestElement,
     isSpreadElement,
     isStringLiteral,
+    isSuper,
     isTSParameterProperty,
+    isTypeCastExpression,
+    JSXElement,
     JSXIdentifier,
     JSXMemberExpression,
     JSXNamespacedName,
     LVal,
     Node,
     OptionalMemberExpression,
-    ParenthesizedExpression
+    ParenthesizedExpression,
+    TypeCastExpression
 } from "@babel/types";
 import {NodePath} from "@babel/traverse";
-import {getAdjustedCallNodePath, getKey, getProperty, isInTryBlockOrBranch, isMaybeUsedAsPromise, isParentExpressionStatement} from "../misc/asthelpers";
+import {
+    getAdjustedCallNodePath,
+    getEnclosingFunction,
+    getKey,
+    getProperty,
+    isInTryBlockOrBranch,
+    isMaybeUsedAsPromise,
+    isParentExpressionStatement
+} from "../misc/asthelpers";
 import {AccessPathToken, AllocationSiteToken, ArrayToken, ClassToken, FunctionToken, NativeObjectToken, ObjectToken, PackageObjectToken, PrototypeToken, Token} from "./tokens";
 import {AccessorType, ConstraintVar, IntermediateVar, isObjectPropertyVarObj, NodeVar, ObjectPropertyVarObj, ReadResultVar} from "./constraintvars";
-import {CallResultAccessPath, IgnoredAccessPath, ModuleAccessPath, PropertyAccessPath, UnknownAccessPath} from "./accesspaths";
+import {
+    CallResultAccessPath,
+    ComponentAccessPath,
+    IgnoredAccessPath,
+    ModuleAccessPath,
+    PropertyAccessPath,
+    UnknownAccessPath
+} from "./accesspaths";
 import Solver, {ListenerKey} from "./solver";
 import {GlobalState} from "./globalstate";
 import {DummyModuleInfo, FunctionInfo, ModuleInfo, normalizeModuleName, PackageInfo} from "./infos";
@@ -97,8 +116,30 @@ export class Operations {
         return v;
     }
 
-    private getRequireHints(pars: NodePath<Node>): Array<string> | undefined {
+    private getRequireHints(pars: NodePath): Array<string> | undefined {
         return this.a.patching?.getRequireHints((pars.node.loc as Location).module?.toString(), locationToString(pars.node.loc, false, true));
+    }
+
+    /**
+     * Models calling a component.
+     * @param path path of the call expression
+     */
+    callComponent(path: NodePath<JSXElement>) {
+        const componentVar = this.expVar(path.node.openingElement.name, path);
+        if (componentVar) {
+            const caller = this.a.getEnclosingFunctionOrModule(path, this.moduleInfo);
+            const f = this.solver.fragmentState; // (don't use in callbacks)
+            f.registerCall(path.node, caller, componentVar);
+            this.solver.addForAllTokensConstraint(componentVar, TokenListener.JSX_ELEMENT, path.node, (t: Token) => {
+                if (t instanceof AccessPathToken)
+                    this.solver.addAccessPath(new ComponentAccessPath(componentVar), this.solver.varProducer.nodeVar(path.node), t.ap);
+                else if (t instanceof FunctionToken) {
+                    const f = this.solver.fragmentState;
+                    f.registerCallEdge(path.node, caller, this.a.functionInfos.get(t.fun)!);
+                    // TODO: model call using one object that has all attributes as properties, see tests/micro/jsx2.jsx
+                }
+            });
+        }
     }
 
     /**
@@ -141,9 +182,14 @@ export class Operations {
             this.callFunctionBound(base, t, calleeVar, argVars, resultVar, strings, path);
         };
 
+        const key =
+            p.isMemberExpression() || p.isOptionalMemberExpression() ? TokenListener.CALL_METHOD
+                : (isIdentifier(path.node.callee) && path.node.callee.name === "require") ? TokenListener.CALL_REQUIRE
+                    : TokenListener.CALL_FUNCTION;
+
         // expression E0(E1,...,En) or new E0(E1,...,En)
         // constraint: ∀ functions t ∈ ⟦E0⟧: ...
-        this.solver.addForAllTokensConstraint(calleeVar, TokenListener.CALL_CALLEE, path.node, (t: Token) => handleCall(undefined, t));
+        this.solver.addForAllTokensConstraint(calleeVar, key, path.node, (t: Token) => handleCall(undefined, t));
         // this looks odd for method calls (E0.p(E1,...,En)), but ⟦E0.p⟧ is empty for method calls
         // (see the special case for visitMemberExpression in astvisitor.ts)
         // the constraint is used for method calls when:
@@ -191,12 +237,15 @@ export class Operations {
                     this.solver.fragmentState.registerCall(pars.node, caller, callees);
                     // the node parameter is required as it defines the argument variables, result variable,
                     // and various implicit parameters of native calls
-                    this.solver.addForAllTokensConstraint(callees, TokenListener.CALL_CALLEE, {n: path.node, t},
-                                                          (ft: Token) => handleCall(t, ft));
+                    this.solver.addForAllTokensConstraint(callees, key, {n: path.node, t},
+                        (ft: Token) => handleCall(t, ft));
                 }
 
-                if (t instanceof AccessPathToken && (prop === "call" || prop === "apply"))
-                    this.solver.addAccessPath(new CallResultAccessPath(baseVar!), resultVar, t.ap);
+                if (t instanceof AccessPathToken)
+                    if (prop === "call" || prop === "apply")
+                        this.solver.addAccessPath(new CallResultAccessPath(baseVar!), resultVar, t.ap);
+                    else if (prop === "bind")
+                        this.solver.addTokenConstraint(t, resultVar);
             });
         }
         const strings = args.length >= 1 && isStringLiteral(args[0]) ? [args[0].value] : [];
@@ -235,7 +284,9 @@ export class Operations {
             this.callFunctionTokenBound(t, base, caller, argVars, resultVar, isNew, path);
         else if (t instanceof NativeObjectToken) {
             f.registerCall(pars.node, caller, undefined, {native: true});
-            if (t.invoke && (!isNew || t.constr))
+            if (options.ignoreImpreciseNativeCalls && calleeVar && f.getTokensSize(f.getRepresentative(calleeVar))[0] > 2)
+                f.warnUnsupported(path.node, `Ignoring imprecise call to ${t}`);
+            else if (t.invoke && (!isNew || t.constr))
                 t.invoke({
                     base,
                     path,
@@ -332,32 +383,39 @@ export class Operations {
         const vp = f.varProducer;
         const pars = getAdjustedCallNodePath(path);
         f.registerCallEdge(pars.node, caller, this.a.functionInfos.get(t.fun)!, kind);
-        const hasArguments = f.functionsWithArguments.has(t.fun);
-        const argumentsToken = hasArguments ? this.a.canonicalizeToken(new ArrayToken(t.fun.body)) : undefined;
+        const argumentsToken = f.functionsWithArguments.has(t.fun) ? this.a.canonicalizeToken(new ArrayToken(t.fun.body)) : undefined;
         for (const [i, arg] of args.entries()) {
             // constraint: ...: ⟦Ei⟧ ⊆ ⟦Xi⟧ for each argument/parameter i (Xi may be a pattern)
-            if (arg) {
-                if (i < t.fun.params.length) {
-                    const param = t.fun.params[i];
-                    if (isRestElement(param)) {
-                        // read the remaining arguments into a fresh array
-                        const rest = args.slice(i);
-                        const t = this.newArrayToken(param);
-                        for (const [i, arg] of rest.entries())
-                            if (arg) // TODO: SpreadElement in arguments (warning emitted below)
-                                addInclusionConstraint(arg, vp.objPropVar(t, String(i)));
-                        this.solver.addTokenConstraint(t, vp.nodeVar(param));
-                    } else
-                        addInclusionConstraint(arg, vp.nodeVar(param));
-                }
-                // constraint ...: ⟦Ei⟧ ⊆ ⟦t_arguments[i]⟧ for each argument i if the function uses 'arguments'
-                if (hasArguments)
-                    addInclusionConstraint(arg, vp.objPropVar(argumentsToken!, String(i)));
+            if (i < t.fun.params.length) {
+                const param = t.fun.params[i];
+                if (isRestElement(param)) {
+                    // read the remaining arguments into a fresh array
+                    const rest = args.slice(i);
+                    const t = this.newArrayToken(param);
+                    for (const [i, rarg] of rest.entries())
+                        if (rarg) // TODO: SpreadElement in arguments (warning emitted below)
+                            addInclusionConstraint(rarg, vp.objPropVar(t, String(i)));
+                    this.solver.addTokenConstraint(t, vp.nodeVar(param));
+                } else if (arg)
+                    addInclusionConstraint(arg, vp.nodeVar(param));
             }
+            // constraint ...: ⟦Ei⟧ ⊆ ⟦t_arguments[i]⟧ for each argument i if the function uses 'arguments'
+            if (argumentsToken && arg)
+                addInclusionConstraint(arg, vp.objPropVar(argumentsToken, String(i)));
         }
-        // constraint: if non-'new', E0 is a member expression E.m and t uses 'this', then ⟦E⟧ ⊆ ⟦this_f⟧
-        if (!isNew && base)
-            addInclusionConstraint(base, vp.thisVar(t.fun));
+        // constraint: ...: t_arguments ∈ ⟦t_arguments⟧ if the function uses 'arguments'
+        if (argumentsToken)
+            this.solver.addTokenConstraint(argumentsToken, vp.argumentsVar(t.fun));
+        // constraint: if non-'new', E0 is a member expression E.m, then ⟦E⟧ ⊆ ⟦this_f⟧
+        if (!isNew && base) {
+            // ...except if E is 'super'
+            if (isMemberExpression(path.node.callee) && isSuper(path.node.callee.object)) {
+                const fun = getEnclosingFunction(path);
+                if (fun)
+                    addInclusionConstraint(vp.thisVar(fun), vp.thisVar(t.fun));
+            } else
+                addInclusionConstraint(base, vp.thisVar(t.fun));
+        }
         // constraint: ...: ⟦ret_t⟧ ⊆ ⟦(new) E0(E1,...,En)⟧
         if (!isParentExpressionStatement(pars))
             this.solver.addSubsetConstraint(vp.returnVar(t.fun), resultVar);
@@ -394,8 +452,6 @@ export class Operations {
 
         // expression E.p or E["p"] or E[i]
         if (prop !== undefined) {
-
-            // TODO: model reads from __proto__ (if options.proto enabled), see nativehelpers.ts:returnPrototypeOf
 
             // constraint: ∀ objects t ∈ ⟦E⟧: ...
             this.solver.addForAllTokensConstraint(base, TokenListener.READ_BASE, lopts, (t: Token) => {
@@ -454,16 +510,20 @@ export class Operations {
         if (base instanceof ArrayToken && prop === "length")
             return undefined;
         const dst = this.solver.varProducer.readResultVar(base, prop);
-        const basePropSpecial =
-            (base instanceof FunctionToken && STANDARD_METHODS.get("Function")!.has(prop)) ||
-            (base instanceof AllocationSiteToken && base.kind !== "Object" && STANDARD_METHODS.get(base.kind)?.has(prop));
-        // constraint: ... ∀ ancestors t2 of t: ...
-        this.solver.addForAllAncestorsConstraint(base, TokenListener.READ_ANCESTORS, {s: prop}, (t2: Token) => {
-            if (basePropSpecial && t2 === this.globalSpecialNatives.get(OBJECT_PROTOTYPE))
-                return; // safe to skip properties at Object.prototype that are in {base.kind}.prototype
-            if (isObjectPropertyVarObj(t2))
-                this.readPropertyBound(t2, prop, dst, {t: base, s: prop}, base);
-        });
+        if (base instanceof FunctionToken && prop === "prototype") // function objects always have 'prototype', no need to consult prototype chain
+            this.readPropertyBound(base, prop, dst, {t: base, s: prop}, base);
+        else {
+            const basePropSpecial =
+                (base instanceof FunctionToken && STANDARD_METHODS.get("Function")!.has(prop)) ||
+                (base instanceof AllocationSiteToken && base.kind !== "Object" && STANDARD_METHODS.get(base.kind)?.has(prop));
+            // constraint: ... ∀ ancestors t2 of t: ...
+            this.solver.addForAllAncestorsConstraint(base, TokenListener.READ_ANCESTORS, {s: prop}, (t2: Token) => {
+                if (basePropSpecial && t2 === this.globalSpecialNatives.get(OBJECT_PROTOTYPE))
+                    return; // safe to skip properties at Object.prototype that are in {base.kind}.prototype
+                if (isObjectPropertyVarObj(t2))
+                    this.readPropertyBound(t2, prop, dst, {t: base, s: prop}, base);
+            });
+        }
         return dst;
     }
 
@@ -499,9 +559,9 @@ export class Operations {
         if (!(t instanceof NativeObjectToken && !t.moduleInfo) && prop !== "prototype") {
             const getter = this.solver.varProducer.objPropVar(t, prop, "get");
             this.solver.addForAllTokensConstraint(getter, TokenListener.READ_GETTER, dstkey,
-                                                  (t3: Token) => readFromGetter(t3));
+                (t3: Token) => readFromGetter(t3));
             this.solver.addForAllTokensConstraint(getter, TokenListener.READ_GETTER_THIS, {t: thist},
-                                                  (t3: Token) => bindGetterThis(thist, t3));
+                (t3: Token) => bindGetterThis(thist, t3));
         }
 
         if (t instanceof PackageObjectToken && t.kind === "Object") {
@@ -645,7 +705,7 @@ export class Operations {
                     m = this.a.reachedFile(filepath, this.moduleInfo);
 
                     // extend the require graph
-                    const fp = path.getFunctionParent()?.node;
+                    const fp = getEnclosingFunction(path);
                     const from = fp ? this.a.functionInfos.get(fp)! : this.moduleInfo;
                     const to = this.a.moduleInfosByPath.get(filepath)!;
                     f.registerRequireEdge(from, to);
@@ -661,7 +721,7 @@ export class Operations {
                         logger.verbose(`Ignoring unresolved module '${str}' at ${locationToStringWithFile(path.node.loc)}`);
                 } else if (isInTryBlockOrBranch(path))
                     f.warn(`Unable to resolve conditionally loaded module '${str}'`, path.node);
-                else if (!(path.isCallExpression() && isIdentifier(path.node.callee) && path.node.callee.name === "require"))
+                else if (path.isCallExpression() && !(isIdentifier(path.node.callee) && path.node.callee.name === "require"))
                     f.warn(`Unable to resolve module '${str}' at indirect require call`, path.node);
                 else
                     f.error(`Unable to resolve module '${str}'`, path.node);
@@ -710,7 +770,10 @@ export class Operations {
             }
 
         } else if (isMemberExpression(dst) || isOptionalMemberExpression(dst)) {
-            const lVar = this.expVar(dst.object, path);
+            const e = getEnclosingFunction(path);
+            const lVar = isSuper(dst.object) ? e ? this.solver.varProducer.thisVar(e) : undefined : this.expVar(dst.object, path);
+            if (!lVar)
+                return;
             const prop = getProperty(dst);
             const enclosing = this.a.getEnclosingFunctionOrModule(path, this.moduleInfo);
 
@@ -787,9 +850,10 @@ export class Operations {
                         // read the property using p for the temporary result
                         this.readProperty(src, prop, vp.nodeVar(p), p, this.a.getEnclosingFunctionOrModule(path, this.moduleInfo));
                         // assign the temporary result at p to the locations represented by p.value
-                        if (!isLVal(p.value))
-                            assert.fail(`Unexpected expression ${p.value.type}, expected LVal at ${locationToStringWithFile(p.value.loc)}`);
-                        this.assign(vp.nodeVar(p), p.value, path);
+                        if (isLVal(p.value))
+                            this.assign(vp.nodeVar(p), p.value, path);
+                        else // TODO: see test262-main/test and TypeScript-main/tests/cases
+                            this.solver.fragmentState.error(`Unexpected expression ${p?.value?.type}, expected LVal at ${locationToStringWithFile(p?.value?.loc)}`);
                     }
                 }
         } else if (isArrayPattern(dst)) {
@@ -819,14 +883,15 @@ export class Operations {
                     }
         } else if (isTSParameterProperty(dst))
             this.assign(src, dst.parameter, path);
+        else if (isTypeCastExpression(dst))
+            this.assign(src, (dst as TypeCastExpression).expression as any, path);
         else if (isMetaProperty(dst))
             this.solver.fragmentState.warnUnsupported(dst, "MetaProperty"); // TODO: MetaProperty, e.g. new.target
-        else {
-            if (!isRestElement(dst))
-                assert.fail(`Unexpected LVal type ${dst.type} at ${locationToStringWithFile(dst.loc)}`);
+        else if (isRestElement(dst)) {
             // assign the array generated at callFunction to the sub-l-value
             this.assign(vp.nodeVar(dst), dst.argument, path);
-        }
+        } else // TODO: see test262-main/test and TypeScript-main/tests/cases
+           this.solver.fragmentState.error(`Unexpected LVal type ${dst.type} at ${locationToStringWithFile(dst.loc)}`);
     }
 
     /**

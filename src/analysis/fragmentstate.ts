@@ -1,7 +1,7 @@
 import {ConstraintVar, ObjectPropertyVarObj} from "./constraintvars";
 import {AccessPathToken, ArrayToken, FunctionToken, ObjectToken, PackageObjectToken, Token} from "./tokens";
 import {DummyModuleInfo, FunctionInfo, ModuleInfo, PackageInfo} from "./infos";
-import {CallExpression, Function, Identifier, isArrowFunctionExpression, JSXIdentifier, NewExpression, Node, OptionalCallExpression, SourceLocation,} from "@babel/types";
+import {CallExpression, Function, Identifier, JSXIdentifier, NewExpression, Node, OptionalCallExpression, SourceLocation,} from "@babel/types";
 import assert from "assert";
 import {addMapHybridSet, locationToStringWithFile, locationToStringWithFileAndEnd, mapGetSet} from "../misc/util";
 import {AccessPath, CallResultAccessPath, ComponentAccessPath, ModuleAccessPath, PropertyAccessPath} from "./accesspaths";
@@ -12,6 +12,7 @@ import {GlobalState} from "./globalstate";
 import {ConstraintVarProducer} from "./constraintvarproducer";
 import Solver from "./solver";
 import {MaybeEmptyPropertyRead} from "../patching/patchdynamics";
+import {getEnclosingNonArrowFunction} from "../misc/asthelpers";
 
 export type ListenerID = bigint;
 
@@ -52,6 +53,11 @@ export type ListenerID = bigint;
  */
 export type RepresentativeVar = ConstraintVar & { readonly __repr: unique symbol };
 export type MergeRepresentativeVar = ConstraintVar & { readonly __repr: unique symbol };
+
+export type PostponedListenerCall =
+    [(t: Token) => void, Token] |
+    [(neighbor: PackageInfo) => void, PackageInfo] |
+    [(prop: string) => void, string];
 
 /**
  * Analysis state for a fragment (a module or a package with dependencies, depending on the analysis phase).
@@ -98,6 +104,8 @@ export class FragmentState<RVT extends RepresentativeVar | MergeRepresentativeVa
 
     readonly tokenListeners: Map<RVT, Map<ListenerID, (t: Token) => void>> = new Map;
 
+    readonly tokenListeners2: Map<RVT, Map<ListenerID, (t: Token) => void>> = new Map;
+
     readonly listenersProcessed: Map<ListenerID, Set<Token>> = new Map;
 
     readonly packageNeighborListeners: Map<PackageInfo, Map<ListenerID, (neighbor: PackageInfo) => void>> = new Map;
@@ -108,11 +116,9 @@ export class FragmentState<RVT extends RepresentativeVar | MergeRepresentativeVa
 
     readonly packageNeighbors: Map<PackageInfo, Set<PackageInfo>> = new Map;
 
-    readonly postponedListenerCalls: Array<
-        [(t: Token) => void, Token] |
-        [(neighbor: PackageInfo) => void, PackageInfo] |
-        [(prop: string) => void, string]
-    > = [];
+    readonly postponedListenerCalls: Array<PostponedListenerCall> = [];
+
+    readonly postponedListenerCalls2: Array<PostponedListenerCall> = [];
 
     /**
      * Map that provides for each function/module the set of modules being required.
@@ -400,8 +406,10 @@ export class FragmentState<RVT extends RepresentativeVar | MergeRepresentativeVa
      * Registers a require/import call.
      */
     registerRequireCall(node: Node, from: ModuleInfo | FunctionInfo, m: ModuleInfo | DummyModuleInfo) {
-        if (options.callgraphRequire)
+        if (options.callgraphRequire) {
             mapGetSet(this.callToModule, node).add(m);
+            this.callLocations.add(node);
+        }
         mapGetSet(this.callToFunctionOrModule, node).add(m);
         this.callToContainingFunction.set(node, from);
     }
@@ -583,23 +591,12 @@ export class FragmentState<RVT extends RepresentativeVar | MergeRepresentativeVa
      * Registers that the current function uses 'arguments'.
      */
     registerArguments(path: NodePath): Function | undefined {
-        const f = this.getEnclosingFunction(path);
+        const f = getEnclosingNonArrowFunction(path);
         if (f) {
             this.functionsWithArguments.add(f);
             if (logger.isDebugEnabled())
                 logger.debug(`Function uses 'arguments': ${locationToStringWithFile(f.loc)}`);
         }
-        return f;
-    }
-
-    /**
-     * Returns the enclosing (non-arrow) function, or undefined if no such function.
-     */
-    getEnclosingFunction(path: NodePath): Function | undefined {
-        let p: NodePath | NodePath<Function> | null | undefined = path, f: Function | undefined;
-        do {
-            f = (p = p?.getFunctionParent())?.node;
-        } while (f && isArrowFunctionExpression(f));
         return f;
     }
 

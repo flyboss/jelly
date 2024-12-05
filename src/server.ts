@@ -47,10 +47,10 @@ import winston from "winston";
 import {tmpdir} from "os";
 import {AnalysisStateReporter} from "./output/analysisstatereporter";
 import {exportCallGraphHtml, exportDataFlowGraphHtml} from "./output/visualizer";
-import {VulnerabilityDetector, VulnerabilityResults} from "./patternmatching/vulnerabilitydetector";
+import {VulnerabilityDetector} from "./patternmatching/vulnerabilitydetector";
 import {readFileSync} from "fs";
 import {Vulnerability} from "./typings/vulnerabilities";
-import {addAll} from "./misc/util";
+import {addAll, stringify} from "./misc/util";
 import {sep} from "path";
 
 const VERSION = require("../package.json").version;
@@ -146,12 +146,12 @@ async function main() {
     }
 
     function sendResponse(res: Response) {
-        const str = JSON.stringify(res);
+        const str = stringify(res, 0);
         process.stdout.write(`Content-Length: ${str.length}\r\n\r\n`);
         process.stdout.write(str);
         process.stdout.write("\r\n");
         if (logger.isVerboseEnabled())
-            logger.verbose(`Message sent: ${JSON.stringify(res, undefined, 2)}`);
+            logger.verbose(`Message sent: ${stringify(res)}`);
     }
 
     function sendErrorResponse(message: string, req?: Request) {
@@ -334,7 +334,7 @@ async function main() {
             if (!tapirPatterns || !patterns)
                 return prepareResponse(false, req, {message: "Patterns have not been loaded"});
             const matcher = new PatternMatcher(solver.fragmentState, typer);
-            const body = convertPatternMatchesToJSON(patterns, matcher);
+            const body = convertPatternMatchesToJSON(patterns, matcher, solver.diagnostics);
             const res: PatternMatchResponse = prepareResponse(true, req, {body});
             logger.info("Sending pattern matching results");
             return res;
@@ -353,16 +353,7 @@ async function main() {
                 return prepareResponse(false, req, {message: "Analysis results not available"});
             if (!options.callgraphHtml)
                 return prepareResponse(false, req, {message: "Option callgraphHtml not set"});
-            const vr: VulnerabilityResults = {};
-            if (vulnerabilityDetector && options.vulnerabilities) {
-                const f = solver.fragmentState;
-                vr.package = vulnerabilityDetector.findPackagesThatMayDependOnVulnerablePackages(f);
-                vr.module = vulnerabilityDetector.findModulesThatMayDependOnVulnerableModules(f);
-                vr.function = vulnerabilityDetector.findFunctionsThatMayReachVulnerableFunctions(f);
-                vr.call = vulnerabilityDetector.findCallsThatMayReachVulnerableFunctions(f, vr.function);
-                vr.matches = vulnerabilityDetector.patternMatch(f, typer, solver.diagnostics);
-                // TODO: include vulnerability pattern match reachability like in main.ts
-            }
+            const vr = options.vulnerabilities && vulnerabilityDetector?.collectAllVulnerabilityResults(solver, typer) || {};
             exportCallGraphHtml(solver.fragmentState, options.callgraphHtml, vr);
             logger.info("Call graph HTML file generated");
             return prepareResponse(true, req);

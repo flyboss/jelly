@@ -39,8 +39,12 @@ export function parseAndDesugar(str: string, file: string, f?: FragmentState): F
             originalAst = parse(str, options);
         } catch (e) { // 'jsx' conflicts with TypeScript legacy cast syntax, see https://babeljs.io/docs/en/babel-plugin-transform-typescript/
             if (logger.isVerboseEnabled())
-                logger.verbose(`Parse error for ${file}${e instanceof Error ? `: ${e.message}` : ""}, retrying with JSX enabled`);
+                logger.verbose(`Parse error for ${file}${e instanceof Error ? `: ${e.message}` : ""}, retrying with JSX and Flow enabled`);
             options.plugins!.push("jsx");
+            if (file.endsWith(".jsx") || file.endsWith(".js")) {
+                options.plugins!.push("flow");
+                options.plugins!.splice(options.plugins?.indexOf("typescript")!, 1); // 'flow' conflicts with 'typescript'
+            }
             originalAst = parse(str, options);
         }
     } catch (e) {
@@ -62,7 +66,7 @@ export function parseAndDesugar(str: string, file: string, f?: FragmentState): F
                     allowDeclareFields: f !== undefined
                 }],
                 ["@babel/plugin-transform-template-literals", { loose: true }]
-            ], // TODO: perform other transformations?
+            ],
             cwd: __dirname,
             configFile: false,
             ast: true,
@@ -82,6 +86,5 @@ export function parseAndDesugar(str: string, file: string, f?: FragmentState): F
     if (res.code) // set 'code: true' above to output desugared code
         if (logger.isDebugEnabled())
             logger.debug("Desugared code:\n" + res.code);
-
     return res.ast!;
 }
